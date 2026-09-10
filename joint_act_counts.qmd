@@ -1,0 +1,621 @@
+---
+title: "Activity Count Forecasting"
+author: "Valerio Gomez-Frittelli"
+format: pdf
+editor: visual
+---
+
+# Data Handling
+
+### Packages
+
+```{r}
+library(tidyverse) |> suppressMessages() |> suppressWarnings()
+library(fpp3) |> suppressMessages() |> suppressWarnings()
+library(forecast) |> suppressMessages() |> suppressWarnings()
+library(zoo) |> suppressMessages() |> suppressWarnings()
+```
+
+## Data Loading
+
+### Load data function
+
+```{r}
+load_data <- function(subject, metric) {
+  paste("../Empatica_data/inputs/", subject, "_", metric, "s", sep="") |>
+    list.files(pattern = "*.csv", full.names = TRUE) |> 
+    lapply(readr::read_csv) |> 
+    bind_rows() |> suppressMessages() |> suppressWarnings()
+}
+```
+
+### SPT04 load data call
+
+```{r}
+spt04_activity_count_df <- load_data("SPT04", "activity_count")
+```
+
+### SPT05 load data call
+
+```{r}
+spt05_activity_count_df <- load_data("SPT05", "activity_count")
+```
+
+## Resample to Daily Average
+
+### Resample function
+
+```{r}
+resample_daily <- function(act_count_df) {
+  act_count_df |> 
+    mutate(day = as.Date(floor_date(timestamp_iso, "day"))) |>
+    group_by(day) |>
+    summarise(act_avg = mean(activity_counts, na.rm = TRUE))
+}
+```
+
+### SPT04 resample call
+
+```{r}
+spt04_act_daily_df <- resample_daily(spt04_activity_count_df)
+```
+
+### SPT05 resample call
+
+```{r}
+spt05_act_daily_df <- resample_daily(spt05_activity_count_df)
+```
+
+## Interpolate Missing Data
+
+### Interpolate function
+
+```{r}
+interpolate_missing <- function(act_daily_df) {
+  act_daily_df_full <- act_daily_df %>%
+    complete(day = seq(min(day), max(day), by = "day"))
+  
+  act_daily_df_full$act_avg <- na.approx(act_daily_df_full$act_avg,
+                                         x = act_daily_df_full$day, 
+                                         rule = 2, na.rm = FALSE)
+  
+  return(act_daily_df_full)
+}
+```
+
+### SPT04 interpolate call
+
+```{r}
+spt04_act_daily_df <- interpolate_missing(spt04_act_daily_df)
+```
+
+### SPT05 interpolate call
+
+```{r}
+spt05_act_daily_df <- interpolate_missing(spt05_act_daily_df)
+```
+
+## Add Phase Labellings
+
+### SPT04 phases
+
+```{r}
+spt04_act_daily_df <- spt04_act_daily_df |> 
+  mutate(phase = ifelse(
+    day < as.Date("2026-02-02"), "Baseline", ifelse(
+      day < as.Date("2026-03-16"), "Rehab", ifelse(
+        day < as.Date("2026-03-23"), "Implant", ifelse(
+          day < as.Date("2026-03-30"), "Implant Recovery", ifelse(
+            day < as.Date("2026-04-20"), "Optimization", ifelse(
+              day < as.Date("2026-05-18"), "Implant+Rehab", "Post-Rehab"
+    ))))))
+  )
+```
+
+### SPT05 phases
+
+```{r}
+spt05_act_daily_df <- spt05_act_daily_df |> 
+  mutate(phase = ifelse(
+    day < as.Date("2026-02-23"), "Baseline", ifelse(
+      day < as.Date("2026-04-06"), "Rehab", ifelse(
+        day < as.Date("2026-04-13"), "Implant", ifelse(
+          day < as.Date("2026-04-20"), "Implant Recovery", ifelse(
+            day < as.Date("2026-05-11"), "Optimization", ifelse(
+              day < as.Date("2026-06-22"), "Implant+Rehab", "Post-Rehab"
+    ))))))
+  )
+```
+
+# Exploratory Plotting
+
+## Activty Count Distribution
+
+### Distribution plotting function
+
+```{r}
+plot_act_dist <- function(act_daily_df, subject) {
+  act_daily_df |> 
+    ggplot(aes(x=act_avg)) + 
+    geom_histogram(aes(fill=phase), binwidth=10, alpha=0.5) + 
+    labs(title=paste(subject, "Activity Count Distribution"), 
+         y="Frequency", x="Daily Activity Count Average") + 
+    theme(plot.title=element_text(hjust=0.5))
+}
+```
+
+### SPT04 distribution plot call
+
+```{r}
+plot_act_dist(spt04_act_daily_df, "SPT04")
+```
+
+### SPT05 distribution plot call
+
+```{r}
+plot_act_dist(spt05_act_daily_df, "SPT05")
+```
+
+## Activity Count Longitudinal
+
+### Longitudinal plotting function
+
+```{r}
+plot_act_longitudinal <- function(act_daily_df, subject) {
+  act_daily_df |>
+    ggplot(aes(x=day, y=act_avg)) + geom_line(aes(color=phase)) +
+    labs(y="Average Activity Count", x="Day", 
+         title=paste(subject, "Average Activity Count by Day")) +
+    theme(plot.title = element_text(hjust=0.5))
+}
+```
+
+### SPT04 longitudinal plot call
+
+```{r}
+plot_act_longitudinal(spt04_act_daily_df, "SPT04")
+```
+
+### SPT05 longitudinal plot call
+
+```{r}
+plot_act_longitudinal(spt05_act_daily_df, "SPT05")
+```
+
+# Sample-size backtesting
+
+### Helper functions
+
+```{r}
+# Fit models on current training set
+fit_models <- function(train_tsibble) {
+  train_tsibble |>
+    model(
+      'Mean' = MEAN(act_avg),
+      # Try removing trend/seasonality
+      'ETS' = ETS(act_avg ~ error("A") + trend("A") + season("A")),
+      'ARIMA' = ARIMA(act_avg ~ pdq() + PDQ(),
+                      stepwise=FALSE, greedy=FALSE)
+    )
+}
+
+# Evaluate trained models on current test set
+evaluate_models <- function(forecasts, full_tsibble) {
+  forecasts |>
+    accuracy(full_tsibble) |>
+    select('.model', 'MAPE') |>
+    mutate(Model = .model) |>
+    select(-.model) |>
+    arrange(MAPE)
+}
+
+last_week_avg_forecast <- function(train_tsibble, test_tsibble){
+  train_tsibble |>
+    as_tibble() |> 
+    filter(day >= max(day) - 6) |>
+    pull(act_avg) |>
+    mean() %>% 
+    { tibble(day = test_tsibble$day, fc = rep(., 7)) }
+}
+
+# Manually calculate RMSE for last-week-average forecast
+manual_rmse_comp <- function(predictions_tbl, test_tsibble) {
+  predictions_tbl |> left_join(as_tibble(test_tsibble), by = "day") |>
+    summarise(RMSE = sqrt(mean((fc - actual_act_avg)^2, na.rm = TRUE))) |> 
+    pull(RMSE)
+}
+
+manual_mape_comp <- function(predictions_tbl, test_tsibble) {
+  predictions_tbl |> left_join(as_tibble(test_tsibble), by = "day") |>
+    summarise(MAPE = mean((abs(actual_act_avg - fc)/actual_act_avg)
+                          , na.rm = TRUE) * 100) |> 
+    pull(MAPE)
+}
+```
+
+### Single-size backtesting function
+
+```{r}
+backtest_at_size <- function(sample_size_rmse_tbl, full_tsibble,
+                             train_size, window_shift, abs_start_date) {
+  
+  # Reset windows to beginning of allowed timeframe
+  train_start <- abs_start_date
+  test_start <- train_start + train_size
+  
+  # Run backtesting over all valid train/test windows
+  while(test_start + 6 <= max(full_tsibble$day)) {
+    # 14-day training window
+    train_tsibble <- full_tsibble |> 
+      filter(day >= as.Date(train_start) & day < as.Date(test_start))
+    
+    # 7-day testing window
+    test_tsibble <- full_tsibble |> 
+      filter(day >= test_start & day < (test_start + 7)) |>
+      mutate(actual_act_avg = act_avg) |> select(-act_avg)
+    
+    # Fit new models on current train set and forecast current test week
+    models <- fit_models(train_tsibble)
+    forecasts <- models |> forecast(h=7)
+    
+    evals <- evaluate_models(forecasts, full_tsibble)
+    
+    ets_rmse <- evals |> filter(Model == "ETS") |> pull(MAPE)
+    arima_rmse <- evals |> filter(Model == "ARIMA") |> pull(MAPE)
+    window_avg_rmse <- evals |> filter(Model == "Mean") |> pull(MAPE)
+    
+    # Baseline: Last-week mean of train window
+    last_week_avg_fc <- last_week_avg_forecast(train_tsibble, test_tsibble)
+    last_week_avg_rmse <- manual_mape_comp(last_week_avg_fc, test_tsibble)
+    
+    # Add row to full tibble with all rmses, sample size, and test date
+    sample_size_rmse_tbl <- sample_size_rmse_tbl |> 
+      add_row(
+        # Sample size and test date jointly specify unique 'observations'
+        sample_size = train_size, test_start = test_start,
+        ets_rmses = ets_rmse, arima_rmses = arima_rmse, 
+        window_avg_rmses = window_avg_rmse, 
+        last_week_avg_rmses = last_week_avg_rmse
+      )
+    
+    # Slide train and test windows by specified amount
+    train_start <- train_start + window_shift
+    test_start <- test_start + window_shift
+  }
+  return(sample_size_rmse_tbl)
+}
+```
+
+### Sample-size-range backtesting function
+
+```{r}
+backtest_sample_range <- function(act_daily_df, abs_start_date, 
+                                  window_shift, sample_sizes) {
+  #### Parameters: #####
+  # abs_start_date: Earliest date to start training models
+  # window_shift: How many days to shift train/test windows each iteration
+  # sample_sizes: Vector of sample sizes to backtest on
+  
+  #### Initialization ####
+  full_tsibble <- as_tsibble(act_daily_df, index=day)
+  
+  sample_size_rmse_tbl <- tibble(
+    sample_size          = integer(0),
+    test_start           = as.Date(character(0)),
+    ets_rmses            = numeric(0),
+    arima_rmses          = numeric(0),
+    window_avg_rmses     = numeric(0),
+    last_week_avg_rmses  = numeric(0)
+  )
+  
+  #### Backtesting loop ####
+  for (train_size in sample_sizes) {
+    sample_size_rmse_tbl <- backtest_at_size(
+      sample_size_rmse_tbl, full_tsibble, 
+      train_size, window_shift, abs_start_date
+      )
+  }
+  return(sample_size_rmse_tbl)
+}
+```
+
+### SPT04 sample-size-range backtesting call
+
+```{r}
+spt04_abs_start_date <- as.Date("2026-03-30")
+
+spt04_act_ss_mape_tbl <- backtest_sample_range(
+  spt04_act_daily_df, spt04_abs_start_date, 
+  window_shift=1, sample_sizes=seq(14, 30)
+  )
+```
+
+### SPT05 sample-size-range backtesting call
+
+```{r}
+spt05_abs_start_date <- as.Date("2026-04-20")
+
+spt05_act_ss_mape_tbl <- backtest_sample_range(
+  spt05_act_daily_df, spt05_abs_start_date, 
+  window_shift=1, sample_sizes=seq(14, 30)
+  )
+```
+
+# Backtesting Plotting and Evaluation
+
+## Longitudinal Plotting
+
+### Longitudinal helper function
+
+```{r}
+# Helper function
+plot_model_longitudinal <- function(sample_size_rmse_tbl, train_size, 
+                                    model_col, plot_color, 
+                                    subject, model_name) {
+  if ((sample_size_rmse_tbl |> 
+       filter(sample_size==train_size) |>
+       pull(model_col) |> 
+       max()) < 100) {
+    y_upper_limit <- 100
+  } else {
+    y_upper_limit <- NA
+  }
+  
+  sample_size_rmse_tbl |> filter(sample_size==train_size) |>
+    ggplot(aes(x=test_start, y=.data[[model_col]])) + 
+    geom_line(color=plot_color) +
+    scale_x_date(date_labels = "%b %d", date_breaks = "1 week") +
+    scale_y_continuous(limits=c(0, y_upper_limit)) +
+    labs(title=paste(
+      subject, model_name, 
+      "MAPEs by Test Week, sample size =", 
+      train_size
+    ), y="MAPE", x="Testing week (start)") +
+    theme(plot.title=element_text(hjust=0.5))
+}
+```
+
+### Longitudinal plotting function
+
+```{r}
+plot_sample_sizes_longitudinal <- function(sample_size_rmse_tbl, 
+                                           sample_sizes, subject) {
+  #### Parameters: ####
+  # sample_sizes: Vector of sample sizes to backtest on
+  # subject: A string, either "SPT04" or "SPT05", for plot titles
+  model_cols <- c('ets_rmses', 'arima_rmses', 
+                  'window_avg_rmses', 'last_week_avg_rmses')
+  model_names <- c("ETS", "ARIMA", "Window Mean", "Last-week Average")
+  plot_colors <- c("blue", "red", "green4", "yellow3")
+  
+  
+  for (train_size in sample_sizes) {
+    # Plot longitudinal rmse for each model within each sample size
+    for (model_idx in seq(1, 4)) {
+      model_col <- model_cols[model_idx]
+      model_name <- model_names[model_idx]
+      plot_color <- plot_colors[model_idx]
+      plot_model_longitudinal(sample_size_rmse_tbl, train_size, 
+                              model_col, plot_color,
+                              subject, model_name) |> 
+        print()
+    }
+  }
+}
+```
+
+### SPT04 longitudinal plotting call
+
+Suggestions for sample_size parameter:
+
+seq(lo, hi) creates a vector with all values in the range \[lo, hi\].
+
+unique(sample_size_rmse_tbl\$sample_size) creates a vector of all backtested sample sizes.
+
+```{r}
+plot_sample_sizes_longitudinal(spt04_act_ss_mape_tbl, 
+                               sample_sizes=c(15, 20, 25, 30), "SPT04")
+```
+
+### SPT05 longitudinal plotting call
+
+```{r}
+plot_sample_sizes_longitudinal(spt05_act_ss_mape_tbl, 
+                               sample_sizes=c(19), "SPT05")
+```
+
+## Aggregated Plotting
+
+### Aggregate to sample size function
+
+```{r}
+aggregate_to_sample_size <- function(sample_size_rmse_tbl) {
+  sample_sizes <- unique(sample_size_rmse_tbl$sample_size)
+  result_list <- vector("list", length(sample_sizes))
+  
+  for (i in seq_along(sample_sizes)) {
+    ss <- sample_sizes[i]
+    row <- sample_size_rmse_tbl |> filter(sample_size == ss)
+    
+    result_list[[i]] <- tibble(
+      sample_size      = ss,
+      ets_agg_rmse     = mean(row$ets_rmses, na.rm = TRUE),
+      arima_agg_rmse   = mean(row$arima_rmses, na.rm = TRUE),
+      window_agg_rmse  = mean(row$window_avg_rmses, na.rm = TRUE),
+      last_week_agg_rmse = mean(row$last_week_avg_rmses, na.rm=TRUE)
+    )
+  }
+  
+  return(bind_rows(result_list))
+}
+```
+
+### SPT04 aggregate to sample size call
+
+```{r}
+spt04_act_ss_agg_tbl <- aggregate_to_sample_size(spt04_act_ss_mape_tbl)
+```
+
+### SPT05 aggregate to sample size call
+
+```{r}
+spt05_act_ss_agg_tbl <- aggregate_to_sample_size(spt05_act_ss_mape_tbl)
+```
+
+### Aggregated plotting function
+
+```{r}
+plot_sample_sizes_aggregated <- function(sample_agg_tbl) {
+  # Pivot to allow for plotting all five models at once with a legend
+  sample_agg_tbl |>
+    pivot_longer(
+      cols = c(ets_agg_rmse, arima_agg_rmse,
+               window_agg_rmse, last_week_agg_rmse),
+      names_to = "model",
+      values_to = "agg_rmse"
+    ) |>
+    ggplot(aes(x = sample_size, y = agg_rmse, color = model)) +
+    geom_line() +
+    scale_x_continuous(breaks = unique(sample_agg_tbl$sample_size)) +
+    scale_color_manual(
+      values = c(
+        ets_agg_rmse        = "blue",
+        arima_agg_rmse      = "red",
+        window_agg_rmse     = "green4",
+        last_week_agg_rmse  = "yellow3"
+      ),
+      labels = c(
+        ets_agg_rmse        = "ETS",
+        arima_agg_rmse      = "ARIMA",
+        window_agg_rmse     = "Window Average",
+        last_week_agg_rmse  = "Last-Week Average"
+      )
+    ) +
+    labs(x = "Sample Size", y = "RMSE", color = "Model")
+}
+```
+
+### SPT04 aggregated plotting call
+
+```{r}
+plot_sample_sizes_aggregated(spt04_act_ss_agg_tbl)
+```
+
+### SPT05 aggregated plotting call
+
+```{r}
+plot_sample_sizes_aggregated(spt05_act_ss_agg_tbl)
+```
+
+# Other
+
+### Single Train/Test Split (commented out)
+
+```{r}
+spt05_full_tsibble <- as_tsibble(spt05_act_daily_df, index=day)
+
+# Set start and end of test window
+train_size <- 19
+spt05_train_start <- as.Date("2026-04-20")
+spt05_test_start <- spt05_train_start + train_size
+
+# Training on all data, restricted by phase
+spt05_train_tsibble <- spt05_full_tsibble |> 
+  filter(day >= spt05_train_start & day < spt05_test_start)
+
+
+# Testing set
+spt05_test_tsibble <- spt05_full_tsibble |> 
+  filter(day >= spt05_test_start & day < spt05_test_start + 7) |>
+  mutate(actual_act_avg = act_avg) |> select(-act_avg)
+```
+
+```{r}
+spt05_models <- fit_models(spt05_train_tsibble)
+
+# Display order of Auto-ARIMA model
+print(spt05_models["ARIMA"])
+
+spt05_forecasts <- spt05_models |> forecast(h=7)
+```
+
+# Plotting Model Forecasts
+
+### Benchmark Models
+
+```{r}
+# Convert to tibble for plotting and evaluation
+spt05_mean_forecast_tbl <- spt05_forecasts |> filter(.model=='Mean') |> 
+  as_tibble()
+
+# Plot trend plus exponential smoothing curve plus forecast
+spt05_forecasts |> filter(.model=='Mean') |>
+  autoplot(filter(spt05_full_tsibble, 
+                  day > spt05_train_start & day < spt05_test_start + 7)) +
+  geom_line(aes(y = .fitted), col="#D55E00",
+            data = augment(spt05_models['Mean'])) +
+  guides(colour = "none") + 
+  labs(y="Daily Average Activity Count", x = "Day",
+       title="Observed (Black) vs Mean Activity Counts")
+
+# Close-up view of the week's predictions vs the actual data
+ggplot() +
+  geom_line(data = as_tibble(spt05_test_tsibble),
+            aes(x = day, y = actual_act_avg)) +
+  geom_line(data = spt05_mean_forecast_tbl,
+            aes(x = day, y = .mean), colour = "blue") +
+  labs(y="Daily Average Activity Count", x = "Day", 
+       title="Actual vs Mean Activity Counts for SPT05 June 02-08")
+```
+
+### Exponential Smoothing
+
+```{r}
+# Convert to tibble for plotting and evaluation
+spt05_ets_forecast_tbl <- spt05_forecasts |> filter(.model=='ETS') |> 
+  as_tibble()
+
+# Plot trend plus exponential smoothing curve plus forecast
+spt05_forecasts |> filter(.model=='ETS') |>
+  autoplot(filter(spt05_full_tsibble, 
+                  day > spt05_train_start & day < spt05_test_start + 7)) +
+  geom_line(aes(y = .fitted), col="#D55E00",
+            data = augment(spt05_models['ETS'])) +
+  guides(colour = "none") + 
+  labs(y="Daily Average Activity Count", x = "Day",
+       title="Observed (Black) vs ETS-Fitted (Orange) Activity Counts")
+
+# Close-up view of the week's predictions vs the actual data
+ggplot() +
+  geom_line(data = as_tibble(spt05_test_tsibble),
+            aes(x = day, y = actual_act_avg)) +
+  geom_line(data = spt05_ets_forecast_tbl,
+            aes(x = day, y = .mean), colour = "blue") +
+  labs(y="Daily Average Activity Count", x = "Day", 
+       title="Actual vs ETS-Predicted Activity Counts for SPT05 June 02-08")
+```
+
+### ARIMA
+
+```{r}
+# Convert to tibble for plotting and evaluation
+spt05_arima_forecast_tbl <- spt05_forecasts |> filter(.model=='ARIMA') |> 
+  as_tibble()
+
+# Plot trend plus exponential smoothing curve plus forecast
+spt05_forecasts |> filter(.model=='ARIMA') |>
+  autoplot(filter(spt05_full_tsibble, 
+                  day > spt05_train_start & day < spt05_test_start + 7)) +
+  geom_line(aes(y = .fitted), col="#D55E00",
+            data = augment(spt05_models['ARIMA'])) +
+  guides(colour = "none")
+
+# Close-up view of the week's predictions vs the actual data
+ggplot() +
+  geom_line(data = as_tibble(spt05_test_tsibble),
+            aes(x = day, y = actual_act_avg)) +
+  geom_line(data = spt05_arima_forecast_tbl,
+            aes(x = day, y = .mean), colour = "blue") +
+  labs(y="Daily Average Activity Count", x = "Day", 
+       title="Actual vs ARIMA-Predicted Activity Counts for SPT05 June 05-11")
+```
