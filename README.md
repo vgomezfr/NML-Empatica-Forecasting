@@ -3,10 +3,10 @@ This repo contains:
   2. Two slide decks, one from June 2026 and one from September 2026, presenting findings and next steps.
 
 Brief descriptions of individual files:
-  ARM_IMU Presentation.pptx: Presentation given on 6/9/26 describing the project and detailing initial findings and next steps
-  Valerio NML wrap-up slides.pptx: Slide deck summarizing work done and next steps to avoid duplication of effort by successor(s)
-  empatica_forecast_nn.py: Python script for training MLP, RNN, GRU, and LSTM models to forecast biomarkers
-  joint_act_counts.qmd/joint_heart_rates.qmd/joint_hrvs.qmd: Notebooks for fitting ETS/ARIMA models to biomarkers and backtesting
+  1. ARM_IMU Presentation.pptx: Presentation given on 6/9/26 describing the project and detailing initial findings and next steps
+  2. Valerio NML wrap-up slides.pptx: Slide deck summarizing work done and next steps to avoid duplication of effort by successor(s)
+  3. empatica_forecast_nn.py: Python script for training MLP, RNN, GRU, and LSTM models to forecast biomarkers
+  4. joint_act_counts.qmd/joint_heart_rates.qmd/joint_hrvs.qmd: Notebooks for fitting ETS/ARIMA models to biomarkers and backtesting
 
 Notes on code files' usage:
   1. empatica_forecast_nn.py allows flexible construction of models through command line inputs;
