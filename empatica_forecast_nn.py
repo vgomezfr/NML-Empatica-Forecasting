@@ -105,54 +105,66 @@ class DiffWeightedMSE(torch.nn.Module):
         return mse + self.diff_weight * diff_mse
 
 ##################################### Data Loading ##########################################
-def load_data(subject: str):
+# TODO: set dictionary key names to your biomarker folder names
+def load_data(subject: str, biomarker: str, root: Path):
+    full_data_path = root / f"{subject}_{biomarker}"
+
+    # TODO: update key names to match your biomarker folders
+    csv_biomarker_names = {
+        "activity_counts": "activity_counts",
+        "heart_rates": "pulse_rate_bpm",
+        "prvs": "prv_rmssd_ms"
+    }
+
+    csv_biomarker = csv_biomarker_names[biomarker]
+
     data = pd.concat(
-    [pd.read_csv(f) for f in Path(f'Empatica_data/inputs/{subject}_activity_counts').glob("*.csv")],
+    [pd.read_csv(f) for f in full_data_path.glob("*.csv")],
     ignore_index=True
     )
 
     # Convert timestamp_iso from string to pandas datetime type
     data = (data.assign(timestamp_iso=pd.to_datetime(data["timestamp_iso"])))
 
-    act_daily_df = (
+    daily_df = (
     data
     .assign(day=data["timestamp_iso"].dt.floor("D").dt.date)
-    .groupby("day", as_index=False)["activity_counts"]
+    .groupby("day", as_index=False)[csv_biomarker]
     .mean()
-    .rename(columns={"activity_counts": "act_avg"})
+    .rename(columns={csv_biomarker: "biomarker_avg"})
     )
 
-    act_daily_df['day'] = pd.to_datetime(act_daily_df['day'])
+    daily_df['day'] = pd.to_datetime(daily_df['day'])
 
     ####################### Missing Data Handling ###################
-    act_daily_df = act_daily_df.set_index('day').sort_index()
+    daily_df = daily_df.set_index('day').sort_index()
 
     # Force a complete daily date range
-    full_range = pd.date_range(act_daily_df.index.min(), act_daily_df.index.max(), freq='D')
-    act_daily_df = act_daily_df.reindex(full_range)
-    act_daily_df.index.name = 'day'
+    full_range = pd.date_range(daily_df.index.min(), daily_df.index.max(), freq='D')
+    daily_df = daily_df.reindex(full_range)
+    daily_df.index.name = 'day'
 
     # Linearly interpolate all gaps, index-aware
-    act_daily_df['act_avg'] = act_daily_df['act_avg'].interpolate(
+    daily_df["biomarker_avg"] = daily_df["biomarker_avg"].interpolate(
         method='time', limit_direction='both'
     )
 
     # --- Verify no gaps remain, checked against the real DatetimeIndex ---
-    diffs = act_daily_df.index.to_series().diff().dropna()
+    diffs = daily_df.index.to_series().diff().dropna()
     gap_locs = diffs[diffs != pd.Timedelta(days=1)]
     assert gap_locs.empty, f"Gaps remain in date index:\n{gap_locs}"
 
-    assert act_daily_df['act_avg'].isna().sum() == 0, "NaNs remain in act_avg"
+    assert daily_df['biomarker_avg'].isna().sum() == 0, "NaNs remain in biomarker_avg"
 
-    act_daily_df = act_daily_df.reset_index()
+    daily_df = daily_df.reset_index()
 
-    return act_daily_df
+    return daily_df
 
 ##################################### Data Processing #######################################
 def split_loaders(act_daily_df, train_start_str: str, test_start_str: str, test_end_str: str, 
                   window_size: int, horizon: int = 7, add_channel_dim: bool = True):
     
-    values = act_daily_df["act_avg"].to_numpy()
+    values = act_daily_df["biomarker_avg"].to_numpy()
     dates = act_daily_df["day"].to_numpy()
 
     """
@@ -233,17 +245,26 @@ def split_loaders(act_daily_df, train_start_str: str, test_start_str: str, test_
 
     return train_loader, val_loader, test_loader, scaler, train_dates, val_dates, test_dates
 
-############################ Model evaluation helper function ###############################
+############################ Model evaluation helper functions ###############################
+def calculate_mse(predictions, actual):
+    sq_error = (actual - predictions)**2
+    return sq_error.mean()
+
 def calculate_rmse(predictions, actual):
-    sq_error = (predictions - actual)**2
+    sq_error = (actual - predictions)**2
     return np.sqrt(sq_error.mean())
 
+def calculate_mape(predictions, actual):
+    abs_pct_error = 100 * np.abs(actual - predictions) / actual
+    return abs_pct_error.mean()
+
 ############################## Model Training and Validation ################################
-def train(model, train_loader: DataLoader, val_loader: DataLoader, loss_fn, optimizer, scaler, num_epochs: int):
-    best_val_rmse = float("inf")
+def train(model, train_loader: DataLoader, val_loader: DataLoader, 
+          loss_fn, optimizer, scaler, num_epochs: int, error_metric: str = 'RMSE'):
+    best_val_error = float("inf")
     best_model_state = None
 
-    train_rmses, val_rmses = [], []
+    train_errors, val_errors = [], []
 
     for epoch in range(num_epochs):
         # Training
@@ -264,8 +285,13 @@ def train(model, train_loader: DataLoader, val_loader: DataLoader, loss_fn, opti
         # Rescale predictions and actuals to original scale before calculating and recording RMSE
         y_train_pred_inv = scaler.inverse_transform(np.concatenate(train_preds).reshape(-1, 1)).flatten()
         y_train_inv = scaler.inverse_transform(np.concatenate(train_true).reshape(-1, 1)).flatten()
-        train_rmse = calculate_rmse(y_train_pred_inv, y_train_inv)
-        train_rmses.append(train_rmse)
+
+        if error_metric == 'MAPE':
+            train_error = calculate_mape(y_train_pred_inv, y_train_inv)
+        else: # error_metric == 'RMSE'
+            train_error = calculate_rmse(y_train_pred_inv, y_train_inv)
+
+        train_errors.append(train_error)
 
         # Validation
         model.eval()
@@ -279,23 +305,28 @@ def train(model, train_loader: DataLoader, val_loader: DataLoader, loss_fn, opti
         # Rescale predictions and actuals to original scale before calculating and recording RMSE
         y_val_pred_inv = scaler.inverse_transform(np.concatenate(val_preds).reshape(-1, 1)).flatten()
         y_val_inv = scaler.inverse_transform(np.concatenate(val_true).reshape(-1, 1)).flatten()
-        val_rmse = calculate_rmse(y_val_pred_inv, y_val_inv)
-        val_rmses.append(val_rmse)
 
-        if val_rmse < best_val_rmse:
-            best_val_rmse = val_rmse
-            best_model_state = copy.deepcopy(model.state_dict())
+        if error_metric == 'MAPE':
+            val_error = calculate_mape(y_val_pred_inv, y_val_inv)
+        else: # error_metric == 'RMSE'
+            val_error = calculate_rmse(y_val_pred_inv, y_val_inv)
+
+        val_errors.append(val_error)
+
+        if val_error < best_val_error:
+            best_val_error = val_error
+            best_model_state = copy.deepcopy(model.state_dict())  
 
     # Early stopping: Load the best-performing model (on validation data) at the end of training
     model.load_state_dict(best_model_state)
 
-    return train_rmses, val_rmses
+    return train_errors, val_errors
 
 #################################### Loss-Epoch Plotting ####################################
-def loss_plot(train_rmses: list[float], val_rmses: list[float], config: dict):
+def loss_plot(train_losses: list[float], val_losses: list[float], config: dict):
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(range(len(train_rmses)), train_rmses, label='Train')
-    ax.plot(range(len(val_rmses)), val_rmses, label='Val', linestyle="--")
+    ax.plot(range(len(train_losses)), train_losses, label='Train')
+    ax.plot(range(len(val_losses)), val_losses, label='Val', linestyle="--")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("RMSE Loss")
     ax.set_title(f"""RMSE Loss by Epoch \n 
@@ -307,7 +338,8 @@ def loss_plot(train_rmses: list[float], val_rmses: list[float], config: dict):
     plt.show()
 
 #################################### Forecast Plotting ######################################
-def evaluate_and_plot(model, loader: DataLoader, scaler, dates, split_name: str, config: dict):
+def evaluate_and_plot(model, loader: DataLoader, scaler, dates, 
+                      split_name: str, config: dict, error_metric: str):
     model.eval()
     all_preds, all_actuals = [], []
     with torch.no_grad():
@@ -323,7 +355,10 @@ def evaluate_and_plot(model, loader: DataLoader, scaler, dates, split_name: str,
     y_pred   = scaler.inverse_transform(y_pred.reshape(-1, 1)).reshape(y_pred.shape)
     y_actual = scaler.inverse_transform(y_actual.reshape(-1, 1)).reshape(y_actual.shape)
 
-    rmse = calculate_rmse(y_pred, y_actual)
+    if error_metric == 'MAPE':
+        error = calculate_mape(y_pred, y_actual)
+    else: # error_metric == 'RMSE':
+        error = calculate_rmse(y_pred, y_actual)
 
     # If using a multi-step horizon: plot only the first forecast step to avoid overlap issues
     if y_pred.ndim > 1:
@@ -337,22 +372,23 @@ def evaluate_and_plot(model, loader: DataLoader, scaler, dates, split_name: str,
     ax.plot(dates, y_actual_plot, label="Actual")
     ax.plot(dates, y_pred_plot,   label="Predicted", linestyle="--")
     ax.set_xlabel("Date")
-    ax.set_ylabel("Activity count average")
-    ax.set_title(f"""{config["subject"]} Actual vs Predicted Activity Counts ({split_name}). RMSE: {rmse:.2f} \n
-                    Prompt: '% python empatica_forecast_nn.py {config["model_type"]} {config["subject"]} 
-                    {config["train_start"]} {config["test_start"]} {config["test_end"]} {config["window_size"]} 
-                    {config["hidden_size"]} {config["num_layers"]} {config["lr"]} {config["num_epochs"]}' """)
+    ax.set_ylabel(f"{config["biomarker"]} average")
+    ax.set_title(f"""{config["subject"]} Actual vs Predicted {config["biomarker"]} ({split_name}). 
+                    {error_metric}: {error:.2f} \n Prompt: {config["prompt"]} """)
     ax.legend()
     plt.tight_layout()
     plt.show()
 
-    return y_pred, y_actual, rmse
+    return y_pred, y_actual, error
 
-def main(model_type: str, subject: str, train_start: str, test_start: str, test_end: str, 
+# TODO: Set data root, horizon, and eval metric
+def main(model_type: str, subject: str, biomarker: str, 
+         train_start: str, test_start: str, test_end: str, 
          window_size: int, hidden_size: int, num_layers: int, lr: float, num_epochs: int):
     """
     model_type: Which model to train: {RNN, LSTM, GRU, MLP}
     subject: Which subject to download data and model: {SPT04, SPT05}
+    biomarker: Which biomarker to forecast. Match to name of your csvs folder.
     train_start: First day of data to include in training set. 'YYYY-MM-DD' format.
     test_start: First day of the test window. 'YYYY-MM-DD' format.
     test_end: Last day of the test window, inclusive. Must align with model horizon (7 days by default).
@@ -363,11 +399,21 @@ def main(model_type: str, subject: str, train_start: str, test_start: str, test_
     num_epochs: How many epochs to train
     """
 
-    HORIZON = 7 # How many days to predict from one window of size window_size
+    # TODO: Set DATA_ROOT to the path to the root directory of your data 
+    DATA_ROOT = Path("Empatica_data/inputs/")
+
+    # TODO: Set HORIZON to the number of days you wish to forecast per training window
+    HORIZON = 7
+
+    # TODO: Set ERROR_METRIC to the error metric you wish to display on plots: {RMSE, MAPE}
+    ERROR_METRIC = 'MAPE'
+
+    assert ((ERROR_METRIC == 'MAPE') or (ERROR_METRIC == 'RMSE')), "Set ERROR_METRIC to either RMSE or MAPE"
 
     config = {
         "model_type": model_type,
         "subject": subject,
+        "biomarker": biomarker,
         "train_start": train_start,
         "test_start": test_start,
         "test_end": test_end,
@@ -375,10 +421,14 @@ def main(model_type: str, subject: str, train_start: str, test_start: str, test_
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "lr": lr,
-        "num_epochs": num_epochs
+        "num_epochs": num_epochs,
+        "prompt": f'''% python empatica_forecast_nn.py {model_type} {subject} {biomarker}
+                    {train_start} {test_start} {test_end} 
+                    {window_size} {hidden_size} {num_layers} {lr} {num_epochs}
+                '''
     }
     
-    act_daily_df = load_data(subject)
+    daily_df = load_data(subject, biomarker, DATA_ROOT)
 
     # All recurrent models require a channel dimension in their input, while MLP does not
     channel_dim = True
@@ -396,7 +446,7 @@ def main(model_type: str, subject: str, train_start: str, test_start: str, test_
         channel_dim = False
 
     (train_loader, val_loader, test_loader, scaler, train_dates, val_dates, test_dates) = split_loaders(
-        act_daily_df, 
+        daily_df, 
         train_start, 
         test_start, 
         test_end, 
@@ -407,26 +457,27 @@ def main(model_type: str, subject: str, train_start: str, test_start: str, test_
 
     # Initialize optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = torch.nn.MSELoss()
+    loss_fn = torch.nn.MSELoss(reduction='mean')
     # Alternative loss functions, performance not found to be better but possibly worth working with:
-    # loss_fn = VarianceWeightedMSE(variance_weight=0.4)
-    # loss_fn = DiffWeightedMSE(diff_weight=0.3)
+    # loss_fn = VarianceWeightedMSE(variance_weight=)
+    # loss_fn = DiffWeightedMSE(diff_weight=)
 
-    # Train and validate model, storing RMSEs for loss plotting
-    train_rmses, val_rmses = train(model, train_loader, val_loader, loss_fn, optimizer, scaler, num_epochs)
+    # Train and validate model, storing errors for loss plotting
+    train_errors, val_errors = train(model, train_loader, val_loader, loss_fn, optimizer, scaler, num_epochs)
 
     # Plot training and validation loss against epoch to determine if model is properly training and/or overfitting
-    loss_plot(train_rmses, val_rmses, config)
+    loss_plot(train_errors, val_errors, config)
 
     # Plot final model predictions against actual values for each split
-    evaluate_and_plot(model, train_loader, scaler, train_dates, "Training", config)
-    evaluate_and_plot(model, val_loader, scaler, val_dates, "Validation", config)
-    evaluate_and_plot(model, test_loader, scaler, test_dates, "Testing", config)
+    evaluate_and_plot(model, train_loader, scaler, train_dates, "Training", config, ERROR_METRIC)
+    evaluate_and_plot(model, val_loader, scaler, val_dates, "Validation", config, ERROR_METRIC)
+    evaluate_and_plot(model, test_loader, scaler, test_dates, "Testing", config, ERROR_METRIC)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("model_type", type=str, help="RNN, LSTM, GRU, or MLP")
     parser.add_argument("subject", type=str, help="Subject code: SPT04 or SPT05")
+    parser.add_argument("biomarker", type=str, help="activity_counts, prvs, heart_rates, etc")
     parser.add_argument("train_start", type=str, help="Start date of training data, in 'YYYY-MM-DD' format")
     parser.add_argument("test_start", type=str, help="Start date of test window, in 'YYYY-MM-DD' format")
     parser.add_argument("test_end", type=str, help="End date of test window (inclusive), in 'YYYY-MM-DD' format")
@@ -438,5 +489,6 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    main(args.model_type, args.subject, args.train_start, args.test_start, args.test_end, 
+    main(args.model_type, args.subject, args.biomarker, 
+         args.train_start, args.test_start, args.test_end, 
          args.window_size, args.hidden_size, args.num_layers, args.lr, args.num_epochs)
